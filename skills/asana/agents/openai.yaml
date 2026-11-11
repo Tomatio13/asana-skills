@@ -1,0 +1,4 @@
+interface:
+  display_name: "Asana"
+  short_description: "Asanaのタスクを検索・作成・更新し、日常の進捗管理を行う"
+  default_prompt: "Asanaのタスク管理に $asana を使ってください。"
