@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,446 @@ class ClientTests(unittest.TestCase):
         self.log_patch = patch.object(client, "append_log")
         self.log_patch.start()
         self.addCleanup(self.log_patch.stop)
+
+    def test_comment_mentions_escape_text_and_confirm_user_links(self):
+        task = {"gid": "1"}
+        story = {
+            "gid": "4",
+            "text": "@A @B 確認 ✅",
+            "html_text": '<body><a data-asana-type="user" data-asana-gid="2">@A</a> '
+            '<a data-asana-type="user" data-asana-gid="3">@B</a> 確認 ✅</body>',
+        }
+        with patch.object(
+            client,
+            "_request",
+            side_effect=[
+                {"data": task},
+                {"data": {"gid": "2"}},
+                {"data": {"gid": "3"}},
+                {"data": {"gid": "4"}},
+                {"data": story},
+            ],
+        ) as api:
+            result = client.main(
+                [
+                    "comment",
+                    "--gid",
+                    "1",
+                    "--text",
+                    "確認 ✅ <a> &",
+                    "--mention",
+                    "2",
+                    "--mention",
+                    "3",
+                    "--mention",
+                    "2",
+                ]
+            )
+        self.assertEqual(result["mentions"], ["2", "3"])
+        self.assertEqual(
+            api.call_args_list[3].args,
+            (
+                "POST",
+                "/tasks/1/stories",
+                {"opt_fields": "gid,text,html_text"},
+                {
+                    "html_text": '<body><a data-asana-gid="2"/> <a data-asana-gid="3"/> 確認 ✅ &lt;a&gt; &amp;</body>'
+                },
+            ),
+        )
+        self.assertEqual(api.call_args.args[1], "/stories/4")
+        row = client.append_log.call_args.args[0]
+        self.assertEqual(row["requested"]["mentions"], ["2", "3"])
+        self.assertEqual(row["diff"]["after"]["mentions"], ["2", "3"])
+
+    def test_comment_unconfirmed_mention_does_not_repost(self):
+        story = {
+            "gid": "4",
+            "html_text": '<body><a data-asana-type="task" data-asana-gid="2">Task</a></body>',
+        }
+        with patch.object(
+            client,
+            "_request",
+            side_effect=[
+                {"data": {"gid": "1"}},
+                {"data": {"gid": "2"}},
+                {"data": story},
+            ],
+        ) as api:
+            result = client.main(
+                ["comment", "--gid", "1", "--text", "確認", "--mention", "2"]
+            )
+        self.assertEqual(result["status"], "written_but_unverified")
+        self.assertEqual(result["gid"], "4")
+        self.assertEqual(
+            [call.args[0] for call in api.call_args_list], ["GET", "GET", "POST"]
+        )
+
+    def test_upload_attachment_checks_uploaded_gid_and_logs_only_metadata(self):
+        attachment = {
+            "gid": "3",
+            "name": "spec.txt",
+            "view_url": "https://example.com/file",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / attachment["name"]
+            path.write_bytes(b"file payload")
+            with patch.object(
+                client,
+                "_request",
+                side_effect=[
+                    {"data": {"gid": "2"}},
+                    {"data": {"gid": "3"}},
+                    {"data": [{"gid": "4", "name": "spec.txt"}, attachment]},
+                ],
+            ) as api:
+                result = client.main(
+                    ["upload-attachment", "--gid", "2", "--file", str(path)]
+                )
+        self.assertEqual(result["data"], attachment)
+        self.assertEqual(
+            api.call_args_list[1].args,
+            (
+                "POST",
+                "/attachments",
+                None,
+                {"parent": "2", "name": "spec.txt"},
+            ),
+        )
+        self.assertEqual(api.call_args_list[1].kwargs, {"upload": b"file payload"})
+        logs = str(client.append_log.call_args_list)
+        for excluded in (str(path), "file payload", attachment["view_url"]):
+            self.assertNotIn(excluded, logs)
+        self.assertEqual(
+            client.append_log.call_args.args[0]["target"]["attachment_gid"], "3"
+        )
+
+    def test_delete_attachment_requires_membership_and_verifies_absence(self):
+        args = ["delete-attachment", "--gid", "2", "--attachment", "3"]
+        with patch.object(
+            client,
+            "_request",
+            side_effect=[
+                {"data": {"gid": "2"}},
+                {"data": [{"gid": "4", "name": "other.txt"}]},
+            ],
+        ) as api:
+            with self.assertRaisesRegex(ValueError, "attachment_not_found_on_task"):
+                client.main(args)
+            self.assertEqual(
+                [call.args[0] for call in api.call_args_list], ["GET", "GET"]
+            )
+        item = {"gid": "3", "name": "spec.txt"}
+        for remaining in ([], [item]):
+            with self.subTest(remaining=remaining):
+                with patch.object(
+                    client,
+                    "_request",
+                    side_effect=[
+                        {"data": {"gid": "2"}},
+                        {"data": [item]},
+                        {"data": {}},
+                        {"data": remaining},
+                    ],
+                ) as api:
+                    result = client.main(args)
+                self.assertEqual(
+                    api.call_args_list[2].args, ("DELETE", "/attachments/3", None, None)
+                )
+                self.assertEqual(len(api.call_args_list), 4)
+                if remaining:
+                    self.assertEqual(result["status"], "written_but_unverified")
+                else:
+                    self.assertTrue(result["data"]["deleted"])
+
+    def test_attachment_multipart_preserves_japanese_filename_and_bytes(self):
+        body, content_type = client.attachment_body("2", "資料.png", b"\x00\xff")
+        boundary = content_type.split("boundary=")[1].encode("ascii")
+        self.assertIn(b'name="parent"\r\n\r\n2\r\n', body)
+        self.assertIn('filename="資料.png"'.encode("utf-8"), body)
+        self.assertIn(b"Content-Type: image/png\r\n\r\n\x00\xff", body)
+        self.assertTrue(body.endswith(b"\r\n--" + boundary + b"--\r\n"))
+
+    def test_dependency_direction_and_confirmed_state(self):
+        prerequisite = {"gid": "1", "name": "原稿", "completed": False}
+        task = {"gid": "2", "name": "校正"}
+        with patch.object(
+            client,
+            "_request",
+            side_effect=[
+                {"data": prerequisite},
+                {"data": task},
+                {"data": []},
+                {"data": {}},
+                {"data": [prerequisite]},
+            ],
+        ) as api:
+            result = client.main(["add-dependency", "--gid", "2", "--depends-on", "1"])
+        self.assertEqual(
+            api.call_args_list[3].args,
+            (
+                "POST",
+                "/tasks/2/addDependencies",
+                None,
+                {"dependencies": ["1"]},
+            ),
+        )
+        self.assertEqual(result["data"], [prerequisite])
+        row = client.append_log.call_args.args[0]
+        self.assertEqual(row["target"]["task_gid"], "2")
+        self.assertEqual(row["target"]["dependency_gid"], "1")
+        self.assertEqual(row["diff"]["after"], {"dependencies": ["1"]})
+
+    def test_dependency_on_later_page_does_not_write(self):
+        with patch.object(
+            client,
+            "_request",
+            side_effect=[
+                {"data": {"gid": "1"}},
+                {"data": {"gid": "2"}},
+                {"data": [{"gid": "3"}], "next_page": {"offset": "page2"}},
+                {"data": [{"gid": "1"}]},
+            ],
+        ) as api:
+            result = client.main(["add-dependency", "--gid", "2", "--depends-on", "1"])
+        self.assertTrue(result["already_set"])
+        self.assertEqual(api.call_args.args[2]["offset"], "page2")
+        self.assertTrue(all(call.args[0] == "GET" for call in api.call_args_list))
+
+    def test_dependency_self_reference_does_not_call_api(self):
+        with patch.object(client, "_request") as api:
+            with self.assertRaises(SystemExit):
+                client.main(["add-dependency", "--gid", "2", "--depends-on", "2"])
+        api.assert_not_called()
+
+    def test_add_project_preserves_original_membership(self):
+        task = {
+            "gid": "1",
+            "workspace": {"gid": "2"},
+            "memberships": [
+                {"project": {"gid": "3"}, "section": {"gid": "4"}},
+            ],
+        }
+        target = {"project": {"gid": "5"}, "section": {"gid": "6"}}
+        after = dict(task, memberships=task["memberships"] + [target])
+        with patch.object(
+            client,
+            "_request",
+            side_effect=[
+                {"data": task},
+                {"data": {"workspace": {"gid": "2"}}},
+                {"data": {"project": {"gid": "5"}}},
+                {"data": {}},
+                {"data": after},
+            ],
+        ) as api:
+            result = client.main(
+                ["add-project", "--gid", "1", "--project", "5", "--section", "6"]
+            )
+        self.assertEqual(result["data"], after)
+        self.assertEqual(
+            api.call_args_list[3].args,
+            (
+                "POST",
+                "/tasks/1/addProject",
+                None,
+                {"project": "5", "section": "6"},
+            ),
+        )
+
+    def test_add_project_with_existing_membership_does_not_reorder(self):
+        task = {
+            "workspace": {"gid": "2"},
+            "memberships": [
+                {"project": {"gid": "5"}, "section": {"gid": "7"}},
+            ],
+        }
+        with patch.object(
+            client,
+            "_request",
+            side_effect=[
+                {"data": task},
+                {"data": {"workspace": {"gid": "2"}}},
+                {"data": {"project": {"gid": "5"}}},
+            ],
+        ) as api:
+            result = client.main(
+                ["add-project", "--gid", "1", "--project", "5", "--section", "6"]
+            )
+        self.assertEqual(result["status"], "already_in_project_different_section")
+        self.assertEqual(result["current_section_gid"], "7")
+        self.assertTrue(all(call.args[0] == "GET" for call in api.call_args_list))
+
+    def test_custom_field_numeric_values_and_null_are_verified(self):
+        for value in (0, None):
+            with self.subTest(value=value):
+                task = {
+                    "gid": "1",
+                    "memberships": [{"project": {"gid": "2"}}],
+                    "custom_fields": [{"gid": "3", "number_value": 8}],
+                }
+                settings = {
+                    "data": [
+                        {
+                            "custom_field": {
+                                "gid": "3",
+                                "name": "見積",
+                                "resource_subtype": "number",
+                            }
+                        }
+                    ]
+                }
+                after = dict(task, custom_fields=[{"gid": "3", "number_value": value}])
+                with patch.object(
+                    client,
+                    "_request",
+                    side_effect=[
+                        {"data": task},
+                        settings,
+                        {"data": {}},
+                        {"data": after},
+                    ],
+                ) as api:
+                    result = client.main(
+                        [
+                            "set-custom-field",
+                            "--gid",
+                            "1",
+                            "--project",
+                            "2",
+                            "--field",
+                            "3",
+                            "--data",
+                            client.json.dumps({"value": value}),
+                        ]
+                    )
+                self.assertEqual(result["data"], after)
+                self.assertEqual(
+                    api.call_args_list[2].args,
+                    (
+                        "PUT",
+                        "/tasks/1",
+                        None,
+                        {"custom_fields": {"3": value}},
+                    ),
+                )
+                row = client.append_log.call_args.args[0]
+                self.assertEqual(row["target"]["field_name"], "見積")
+                self.assertEqual(row["diff"]["before"], {"number_value": 8})
+
+    def test_custom_field_validation_blocks_write(self):
+        for subtype, extra, value in (
+            ("number", {}, True),
+            ("number", {"is_formula_field": True}, 0),
+            ("text", {"id_prefix": "ID"}, "value"),
+            ("enum", {"enum_options": [{"gid": "4", "enabled": False}]}, "4"),
+        ):
+            with self.subTest(subtype=subtype, value=value):
+                settings = {
+                    "data": [
+                        {
+                            "custom_field": {
+                                "gid": "3",
+                                "name": "項目",
+                                "resource_subtype": subtype,
+                                **extra,
+                            }
+                        }
+                    ]
+                }
+                task = {"memberships": [{"project": {"gid": "2"}}]}
+                with patch.object(
+                    client, "_request", side_effect=[{"data": task}, settings]
+                ) as api:
+                    with self.assertRaises((RuntimeError, ValueError)):
+                        client.main(
+                            [
+                                "set-custom-field",
+                                "--gid",
+                                "1",
+                                "--project",
+                                "2",
+                                "--field",
+                                "3",
+                                "--data",
+                                client.json.dumps({"value": value}),
+                            ]
+                        )
+                self.assertTrue(
+                    all(call.args[0] == "GET" for call in api.call_args_list)
+                )
+
+    def test_custom_field_confirmation_failure_and_mismatch_do_not_repeat_put(self):
+        task = {
+            "gid": "1",
+            "memberships": [{"project": {"gid": "2"}}],
+            "custom_fields": [{"gid": "3", "enum_value": None}],
+        }
+        settings = {
+            "data": [
+                {
+                    "custom_field": {
+                        "gid": "3",
+                        "name": "優先度",
+                        "resource_subtype": "enum",
+                        "enum_options": [{"gid": "4", "name": "高", "enabled": True}],
+                    }
+                }
+            ]
+        }
+        for confirmation in (RuntimeError("network_failure"), {"data": task}):
+            with self.subTest(confirmation=confirmation):
+                with patch.object(
+                    client,
+                    "_request",
+                    side_effect=[
+                        {"data": task},
+                        settings,
+                        {"data": {}},
+                        confirmation,
+                    ],
+                ) as api:
+                    result = client.main(
+                        [
+                            "set-custom-field",
+                            "--gid",
+                            "1",
+                            "--project",
+                            "2",
+                            "--field",
+                            "3",
+                            "--data",
+                            '{"value":"4"}',
+                        ]
+                    )
+                self.assertEqual(result["status"], "written_but_unverified")
+                self.assertEqual(result["expected"], {"enum_value": "4"})
+                self.assertEqual(
+                    [call.args[0] for call in api.call_args_list],
+                    ["GET", "GET", "PUT", "GET"],
+                )
+
+    def test_attachment_list_keeps_pagination_and_omits_view_url_from_log(self):
+        attachment = {
+            "gid": "2",
+            "name": "spec.pdf",
+            "view_url": "https://example.com/file",
+        }
+        with patch.object(
+            client,
+            "_request",
+            side_effect=[
+                {"data": {"gid": "1"}},
+                {"data": [attachment], "next_page": {"offset": "page2"}},
+            ],
+        ) as api:
+            result = client.main(["attachments", "--gid", "1", "--max-items", "1"])
+        self.assertEqual(
+            result, {"data": [attachment], "has_more": True, "next_offset": "page2"}
+        )
+        self.assertEqual(api.call_args.args[1], "/attachments")
+        self.assertEqual(api.call_args.args[2]["parent"], "1")
+        self.assertNotIn(attachment["view_url"], str(client.append_log.call_args_list))
 
     def test_audit_start_failure_blocks_api(self):
         client.append_log.side_effect = OSError("disk full")
@@ -214,8 +655,6 @@ class ClientTests(unittest.TestCase):
         self.assertLessEqual(len(result["text"]), 51)
 
     def test_http_metadata_is_captured(self):
-        import io
-
         response = unittest.mock.MagicMock()
         response.status = 200
         response.headers = {"X-Asana-Request-Id": "req123"}

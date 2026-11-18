@@ -24,11 +24,20 @@ OPERATIONS = {
     "move": "セクション移動",
     "subtasks": "サブタスク一覧",
     "create-subtask": "サブタスク作成",
+    "dependencies": "先行タスク一覧",
+    "add-dependency": "先行タスク追加",
+    "add-project": "プロジェクトに追加",
+    "custom-fields": "カスタムフィールド一覧",
+    "set-custom-field": "カスタムフィールド更新",
+    "attachments": "添付ファイル一覧",
+    "upload-attachment": "添付ファイルの追加",
+    "delete-attachment": "添付ファイルの削除",
 }
 FIELDS = {
     "name": "名前",
     "notes": "説明",
     "text": "コメント",
+    "mentions": "メンション先ユーザーGID",
     "assignee": "担当者",
     "start_on": "開始日",
     "start_at": "開始日時",
@@ -38,6 +47,12 @@ FIELDS = {
     "projects": "プロジェクト",
     "workspace": "ワークスペース",
     "task": "移動するタスク",
+    "dependencies": "先行タスク",
+    "project_membership": "追加先プロジェクト・セクション",
+    "enum_value": "選択肢",
+    "number_value": "数値",
+    "text_value": "テキスト",
+    "attachment": "添付ファイル",
 }
 OUTCOMES = {
     "success": "成功",
@@ -45,6 +60,7 @@ OUTCOMES = {
     "help": "ヘルプ表示",
     "write_outcome_unknown": "書き込み結果不明",
     "written_but_unverified": "書き込み成功・反映確認未完了",
+    "already_in_project_different_section": "所属済み・現在のセクションが指定先と異なる",
     "audit_log_finish_failed": "終了ログ保存失敗",
 }
 MISSING = object()
@@ -256,6 +272,12 @@ def render_run(run_id, rows):
         ("task_gid", "タスクGID"),
         ("parent_task_gid", "親タスクGID"),
         ("project_gid", "プロジェクトGID"),
+        ("destination_project_gid", "追加先プロジェクトGID"),
+        ("dependency_gid", "先行タスクGID"),
+        ("field_project_gid", "項目のプロジェクトGID"),
+        ("field_gid", "項目GID"),
+        ("field_name", "項目名"),
+        ("attachment_gid", "添付GID"),
         ("workspace_gid", "ワークスペースGID"),
         ("permalink_url", "URL"),
     ):

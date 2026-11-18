@@ -110,3 +110,37 @@ workspacesが取得できない場合はworkspace_membership_unverified。
 ユーザー名・メール・GID・所属確認結果は実行ログのtargetにも記録する。
 
 公式仕様: https://developers.asana.com/reference/getuser
+
+## 依存関係・プロジェクトへの追加
+
+- `dependencies --gid TASK_GID` で、そのタスクが待っている直接の先行タスクと完了状態を取得する。
+- `add-dependency --gid WAITING_GID --depends-on PREREQUISITE_GID` で、待つ側から先行タスクへの依存関係を追加する。登録済みなら `already_set: true` を返す。
+- `add-project --gid TASK_GID --project PROJECT_GID [--section SECTION_GID]` で、既存タスクを同じワークスペースの別プロジェクトにも追加する。追加先に所属済みなら、配置が一致する場合は `already_set: true`、指定したセクションと異なる場合は `already_in_project_different_section` と現在地を返す。
+
+[依存関係の追加](https://developers.asana.com/reference/adddependenciesfortask) · [プロジェクトへの追加](https://developers.asana.com/reference/addprojectfortask)
+
+## カスタムフィールド
+
+- `custom-fields --project PROJECT_GID` で項目定義を取得する。各要素の `custom_field` に名前、GID、型、単一選択の選択肢が入る。
+- `set-custom-field --gid TASK_GID --project PROJECT_GID --field FIELD_GID --data '{"value":8}'` で数値を設定する。単一選択は有効な選択肢GIDを文字列で指定し、テキストは文字列を渡す。解除は `{"value":null}` を使う。入力は `--data-file` でも渡せる。
+- 更新対象はプロジェクトに所属するタスクの、適用済みの単一選択・数値・テキスト項目。数値はフィールドの精度に合わせて指定する。アカウントの契約や閲覧・編集権限により利用できない場合がある。
+
+[項目定義の取得](https://developers.asana.com/reference/getcustomfieldsettingsforproject) · [カスタムフィールドの仕様](https://developers.asana.com/docs/custom-fields-guide)
+
+## メンション付きコメント
+
+`comment --gid TASK_GID --mention USER_GID --text "確認をお願いします ✅"` で、本文の先頭にユーザーメンションを追加する。`--mention` は複数回指定でき、本文は `--text-file` でも渡せる。
+相手がタスクの担当者・フォロワーに含まれていない場合、メンションだけではAsanaから自動通知されない。投稿済みでメンションの反映を確認できない場合は、返されたコメントGIDで確認する。
+
+[Asanaのメンションと通知](https://developers.asana.com/docs/rich-text#links)
+
+## 添付ファイル
+
+`attachments --gid TASK_GID` で添付名、GID、提供元、利用できる閲覧用URLを取得する。説明文内の画像も含まれる。空の一覧は取得成功を示す。
+
+- `upload-attachment --gid TASK_GID --file PATH` でローカルファイル1件をアップロードする。上限は100 MB。反映確認にはAsanaが返した添付GIDを使う。
+- `delete-attachment --gid TASK_GID --attachment ATTACHMENT_GID` で添付を削除する。削除前に指定タスクへの所属を確認し、削除後に一覧から外れたことを確認する。先に `attachments` で添付GIDを調べる。
+
+新しい一覧コマンドは `--max-items`（既定100）と `--offset` に対応する。後続ページがあるかは `has_more` と `next_offset` で確認する。
+
+[添付一覧API](https://developers.asana.com/reference/getattachmentsforobject) · [アップロードAPI](https://developers.asana.com/reference/createattachmentforobject) · [削除API](https://developers.asana.com/reference/deleteattachment)

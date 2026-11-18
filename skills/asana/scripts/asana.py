@@ -7,12 +7,16 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import math
+import mimetypes
 import os
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape
 
 BASE = "https://app.asana.com/api/1.0"
 RUN_ID = ContextVar("asana_run_id", default=None)
@@ -34,6 +38,14 @@ ACTIONS = {
     "move": "move_task",
     "subtasks": "list_subtasks",
     "create-subtask": "create_subtask",
+    "dependencies": "list_dependencies",
+    "add-dependency": "add_dependency",
+    "add-project": "add_project",
+    "custom-fields": "list_custom_fields",
+    "set-custom-field": "set_custom_field",
+    "attachments": "list_attachments",
+    "upload-attachment": "upload_attachment",
+    "delete-attachment": "delete_attachment",
 }
 
 
@@ -70,6 +82,15 @@ def operation_summary(context, outcome):
         "task_name": task.get("name"),
         "permalink_url": task.get("permalink_url"),
     }
+    for argument, field in (
+        ("depends-on", "dependency_gid"),
+        ("field", "field_gid"),
+        ("attachment", "attachment_gid"),
+    ):
+        if context.get(argument):
+            target[field] = context[argument]
+    if context["operation"] == "add-project":
+        target["destination_project_gid"] = context.get("project")
     if isinstance(task.get("workspace"), dict):
         target["workspace_gid"] = task["workspace"].get("gid")
     projects = task.get("projects") or [
@@ -89,6 +110,11 @@ def operation_summary(context, outcome):
             membership_verified=resolved.get("membership_verified", False),
         )
     requested = primary.get("requested") or {}
+    if "comment_mentions" in state:
+        requested = {
+            "text": state["comment_text"],
+            "mentions": state["comment_mentions"],
+        }
     before = primary.get("before") or {}
     after = {}
     if writes and primary.get("outcome") == "success":
@@ -102,6 +128,8 @@ def operation_summary(context, outcome):
                 for k, v in (primary.get("observed") or {}).items()
                 if k in ("gid", "text")
             }
+            if "confirmed_mentions" in state:
+                after["mentions"] = state["confirmed_mentions"]
         if context["operation"] != "comment":
             after = {k: task[k] for k in requested if k in task}
     diff = {
@@ -113,6 +141,11 @@ def operation_summary(context, outcome):
     if context["operation"] in ("create", "create-subtask", "comment"):
         diff["before"] = None  # New resource; no pre-existing state.
         diff["before_missing"] = []
+    change = state.get("change")
+    if change:
+        target.update(change["target"])
+        requested = change["requested"]
+        diff = change["diff"]
     meta = dict(primary.get("api_meta") or {})
     meta["endpoint"] = (
         primary.get("method", "") + " " + primary.get("path", "")
@@ -177,8 +210,11 @@ def redact(value):
     if isinstance(value, dict):
         return {
             k: (
-                redact(v)[:50] + ("…" if len(redact(v)) > 50 else "")
-                if k in {"notes", "text"} and isinstance(v, str)
+                preview(v)
+                if k in {"notes", "text", "text_value", "html_text"}
+                and isinstance(v, str)
+                else {field: preview(item) for field, item in v.items()}
+                if k == "custom_fields" and isinstance(v, dict)
                 else redact(v)
             )
             for k, v in value.items()
@@ -198,6 +234,13 @@ def redact(value):
         token = os.environ.get("ASANA_ACCESS_TOKEN")
         return value.replace(token, "[REDACTED]") if token else value
     return value
+
+
+def preview(value):
+    safe = redact(value)
+    if isinstance(safe, str) and len(safe) > 50:
+        return safe[:50] + "…"
+    return safe
 
 
 def snapshot(value):
@@ -231,7 +274,7 @@ def snapshot(value):
     return value
 
 
-def request(method, path, params=None, data=None):
+def request(method, path, params=None, data=None, *, upload=None):
     call_id = str(uuid.uuid4())
     common = {
         "run_id": RUN_ID.get() or call_id,
@@ -247,6 +290,8 @@ def request(method, path, params=None, data=None):
     prior = {}
     if state:
         prior = state["cache"].get(path, {})
+        if method != "GET" and state.get("change"):
+            prior = state["change"]["diff"]["before"]
         if path.endswith("/addTask") and data:
             prior = state["cache"].get("/tasks/" + data.get("task", ""), {})
     call = {
@@ -263,7 +308,10 @@ def request(method, path, params=None, data=None):
     # Persist target and previous values before the mutation.
     event("api_started", query=params, requested=data, before=prior)
     try:
-        result = _request(method, path, params, data)
+        if upload is None:
+            result = _request(method, path, params, data)
+        else:
+            result = _request(method, path, params, data, upload=upload)
     except BaseException as error:
         outcome = (
             "write_outcome_unknown"
@@ -331,21 +379,25 @@ def verify_task(gid, written):
         }
 
 
-def _request(method, path, params=None, data=None):
+def _request(method, path, params=None, data=None, *, upload=None):
     token = os.environ.get("ASANA_ACCESS_TOKEN")
     if not token:
         raise RuntimeError("ASANA_ACCESS_TOKEN is required")
     url = BASE + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    body = json.dumps({"data": data}).encode() if data is not None else None
+    content_type = "application/json"
+    if upload is None:
+        body = json.dumps({"data": data}).encode() if data is not None else None
+    else:
+        body, content_type = attachment_body(data["parent"], data["name"], upload)
     for attempt in range(3):
         req = urllib.request.Request(
             url,
             body,
             {
                 "Authorization": "Bearer " + token,
-                "Content-Type": "application/json",
+                "Content-Type": content_type,
             },
             method=method,
         )
@@ -356,7 +408,14 @@ def _request(method, path, params=None, data=None):
                     meta = api_metadata(response)
                     state["active"]["api_meta"] = meta
                     state["active"]["attempts"].append(meta)
-                return json.load(response)
+                try:
+                    return json.load(response)
+                except ValueError:
+                    if method == "GET":
+                        raise
+                    raise RuntimeError(
+                        "write_outcome_unknown: inspect target before retrying"
+                    ) from None
         except urllib.error.HTTPError as exc:
             state = AUDIT.get()
             meta = api_metadata(exc)
@@ -380,7 +439,9 @@ def _request(method, path, params=None, data=None):
             labels = {
                 401: "authentication_failed",
                 403: "permission_denied",
-                402: "paid_search_unavailable",
+                402: "paid_search_unavailable"
+                if path.endswith("/tasks/search")
+                else "plan_required",
                 404: "not_found",
                 429: "rate_limited",
             }
@@ -390,6 +451,9 @@ def _request(method, path, params=None, data=None):
                 for item in payload.get("errors", []):
                     message = item.get("message")
                     if isinstance(message, str):
+                        for value in (data or {}).get("custom_fields", {}).values():
+                            if isinstance(value, str) and len(value) > 50:
+                                message = message.replace(value, preview(value))
                         messages.append(message.replace(token, "[REDACTED]")[:1000])
             except (ValueError, AttributeError, TypeError, OSError):
                 pass
@@ -407,36 +471,380 @@ def _request(method, path, params=None, data=None):
 def listing(path, params, maximum):
     items = []
     while True:
-        page = request("GET", path, dict(params, limit=min(100, maximum - len(items))))
+        limit = 100 if maximum is None else min(100, maximum - len(items))
+        page = request("GET", path, dict(params, limit=limit))
         items.extend(page["data"])
         offset = (page.get("next_page") or {}).get("offset")
-        if not offset or len(items) >= maximum:
+        if not offset or (maximum is not None and len(items) >= maximum):
             return {"data": items, "has_more": bool(offset), "next_offset": offset}
         params = dict(params, offset=offset)
+
+
+DEPENDENCY_FIELDS = "gid,name,completed,permalink_url"
+ATTACHMENT_FIELDS = "gid,name,host,view_url,permanent_url"
+ATTACHMENT_LIMIT = 100_000_000
+TASK_IDENTITY = "gid,name,permalink_url"
+TASK_MEMBERSHIPS = (
+    TASK_IDENTITY + ",workspace.gid,memberships.project.gid,memberships.section.gid"
+)
+FIELD_SETTINGS = (
+    "custom_field.gid,custom_field.name,custom_field.resource_subtype,"
+    "custom_field.is_formula_field,custom_field.id_prefix,"
+    "custom_field.enum_options.gid,custom_field.enum_options.name,"
+    "custom_field.enum_options.enabled"
+)
+
+
+def require_gid(value, flag, parser):
+    if not value or not value.isascii() or not value.isdigit():
+        parser.error(flag + " must be an Asana GID")
+    return value
+
+
+def pagination(params, fields):
+    result = {"opt_fields": fields}
+    if "offset" in params:
+        result["offset"] = params["offset"]
+    return result
+
+
+def dependencies_path(gid):
+    return f"/tasks/{gid}/dependencies"
+
+
+def field_settings_path(project):
+    return f"/projects/{project}/custom_field_settings"
+
+
+def audit_change(target, key, previous, expected):
+    change = {
+        "target": target,
+        "requested": {key: expected},
+        "diff": {
+            "before": {key: previous},
+            "after": {},
+            "before_missing": [],
+            "after_missing": [key],
+        },
+    }
+    state = AUDIT.get()
+    if state is not None:
+        state["change"] = change
+    return change
+
+
+def verify_change(gid, change, read, matches):
+    key, expected = next(iter(change["requested"].items()))
+    try:
+        result, actual = read()
+        change["diff"].update(after={key: actual}, after_missing=[])
+        if matches(actual):
+            return result
+        error = "verification_mismatch"
+    except AuditCompletionError:
+        raise
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError):
+        error = "verification_failed"
+    return {
+        "status": "written_but_unverified",
+        "gid": gid,
+        "expected": change["requested"],
+        "error": error,
+        "next_action": "Read the target state to verify; do not resend the write",
+    }
+
+
+def attachment_body(parent, name, contents):
+    boundary = uuid.uuid4().hex
+    # The live API preserves UTF-8 names and displays percent-encoded names literally.
+    filename = (
+        name.replace("\\", "\\\\")
+        .replace('"', "%22")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+    media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    headers = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="parent"\r\n\r\n{parent}\r\n'
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: {media_type}\r\n\r\n"
+    )
+    return (
+        headers.encode("utf-8") + contents + f"\r\n--{boundary}--\r\n".encode("ascii"),
+        f"multipart/form-data; boundary={boundary}",
+    )
+
+
+def attachment_list(gid):
+    return listing(
+        "/attachments", {"parent": gid, "opt_fields": ATTACHMENT_FIELDS}, None
+    )
+
+
+def find_attachment(items, gid):
+    return next((item for item in items if item["gid"] == gid), None)
+
+
+def upload_attachment(gid, path):
+    if not path.is_file():
+        raise ValueError("attachment_file_must_be_a_regular_file")
+    try:
+        with path.open("rb") as stream:
+            contents = stream.read(ATTACHMENT_LIMIT + 1)
+    except OSError:
+        raise ValueError("attachment_file_unreadable") from None
+    if len(contents) > ATTACHMENT_LIMIT:
+        raise ValueError("attachment_file_exceeds_100_mb")
+    request("GET", f"/tasks/{gid}", {"opt_fields": TASK_IDENTITY})
+    change = audit_change({}, "attachment", None, {"name": path.name})
+    written = request(
+        "POST",
+        "/attachments",
+        data={"parent": gid, "name": path.name},
+        upload=contents,
+    )
+    attachment_gid = (written.get("data") or {}).get("gid")
+    if attachment_gid:
+        change["target"]["attachment_gid"] = attachment_gid
+
+    def read():
+        result = attachment_list(gid)
+        item = find_attachment(result["data"], attachment_gid)
+        return {"data": item}, snapshot(item)
+
+    return verify_change(gid, change, read, lambda actual: actual is not None)
+
+
+def delete_attachment(gid, attachment_gid):
+    request("GET", f"/tasks/{gid}", {"opt_fields": TASK_IDENTITY})
+    item = find_attachment(attachment_list(gid)["data"], attachment_gid)
+    if item is None:
+        raise ValueError("attachment_not_found_on_task")
+    change = audit_change(
+        {"attachment_gid": attachment_gid}, "attachment", snapshot(item), None
+    )
+    request("DELETE", f"/attachments/{attachment_gid}")
+
+    def read():
+        result = attachment_list(gid)
+        item = find_attachment(result["data"], attachment_gid)
+        return {
+            "data": {"gid": attachment_gid, "task_gid": gid, "deleted": True}
+        }, snapshot(item)
+
+    return verify_change(gid, change, read, lambda actual: actual is None)
+
+
+def comment_with_mentions(gid, content, mentions):
+    for user_gid in mentions:
+        request("GET", f"/users/{user_gid}", {"opt_fields": "gid"})
+    links = " ".join(f'<a data-asana-gid="{user_gid}"/>' for user_gid in mentions)
+    html = f"<body>{links} {escape(content)}</body>"
+    state = AUDIT.get()
+    if state is not None:
+        state.update(comment_text=content, comment_mentions=mentions)
+    fields = {"opt_fields": "gid,text,html_text"}
+    result = request("POST", f"/tasks/{gid}/stories", fields, {"html_text": html})
+    story = result.get("data") or {}
+    story_gid = story.get("gid")
+    try:
+        if story_gid and not story.get("html_text"):
+            result = request("GET", f"/stories/{story_gid}", fields)
+            story = result["data"]
+        body = ElementTree.fromstring(story["html_text"])
+        actual = list(
+            dict.fromkeys(
+                link.attrib["data-asana-gid"]
+                for link in body.iter("a")
+                if link.get("data-asana-type") == "user" and link.get("data-asana-gid")
+            )
+        )
+        if state is not None:
+            state["confirmed_mentions"] = actual
+        if story_gid and set(mentions).issubset(actual):
+            return dict(result, mentions=actual)
+    except AuditCompletionError:
+        raise
+    except (
+        RuntimeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        ElementTree.ParseError,
+        OSError,
+    ):
+        pass
+    return {
+        "status": "written_but_unverified",
+        "gid": story_gid,
+        "task_gid": gid,
+        "expected_mentions": mentions,
+        "next_action": "Read the existing story to verify; do not repost",
+    }
+
+
+def add_dependency(gid, prerequisite):
+    request("GET", f"/tasks/{prerequisite}", {"opt_fields": TASK_IDENTITY})
+    task = request("GET", f"/tasks/{gid}", {"opt_fields": TASK_IDENTITY})
+    path = dependencies_path(gid)
+
+    def read():
+        result = listing(path, {"opt_fields": DEPENDENCY_FIELDS}, None)
+        return result, [item["gid"] for item in result["data"]]
+
+    _, previous = read()
+    if prerequisite in previous:
+        return dict(task, already_set=True, dependency_gid=prerequisite)
+    change = audit_change(
+        {"dependency_gid": prerequisite}, "dependencies", previous, [prerequisite]
+    )
+    request(
+        "POST", f"/tasks/{gid}/addDependencies", data={"dependencies": [prerequisite]}
+    )
+    return verify_change(gid, change, read, lambda actual: prerequisite in actual)
+
+
+def task_memberships(task):
+    return {
+        item["project"]["gid"]: (item.get("section") or {}).get("gid")
+        for item in task["memberships"]
+    }
+
+
+def add_project(gid, project, section):
+    path = f"/tasks/{gid}"
+    params = {"opt_fields": TASK_MEMBERSHIPS}
+    task = request("GET", path, params)
+    destination = request(
+        "GET", f"/projects/{project}", {"opt_fields": "workspace.gid"}
+    )["data"]
+    workspace = (task["data"].get("workspace") or {}).get("gid")
+    if not workspace or workspace != (destination.get("workspace") or {}).get("gid"):
+        raise RuntimeError("task_and_project_workspace_mismatch")
+    if section:
+        parent = request("GET", f"/sections/{section}", {"opt_fields": "project.gid"})[
+            "data"
+        ]
+        if (parent.get("project") or {}).get("gid") != project:
+            raise RuntimeError("section_not_in_destination_project")
+    memberships = task_memberships(task["data"])
+    if project in memberships:
+        current = memberships[project]
+        if section and section != current:
+            return {
+                "status": "already_in_project_different_section",
+                "gid": gid,
+                "project_gid": project,
+                "current_section_gid": current,
+                "requested_section_gid": section,
+            }
+        return dict(task, already_set=True)
+    placement = {"project": project}
+    if section:
+        placement["section"] = section
+    change = audit_change(
+        {"destination_project_gid": project}, "project_membership", None, placement
+    )
+
+    def read():
+        result = request("GET", path, params)
+        after = task_memberships(result["data"])
+        actual = (
+            {"project": project, "section": after[project]}
+            if project in after
+            else None
+        )
+        if memberships.keys() - after.keys():
+            raise RuntimeError("original_project_membership_missing")
+        return result, actual
+
+    request("POST", path + "/addProject", data=placement)
+    return verify_change(
+        gid,
+        change,
+        read,
+        lambda actual: (
+            actual is not None and (section is None or actual["section"] == section)
+        ),
+    )
+
+
+def set_custom_field(gid, project, field_gid, value):
+    path = f"/tasks/{gid}"
+    params = {
+        "opt_fields": TASK_MEMBERSHIPS
+        + ",custom_fields.gid,custom_fields.text_value,custom_fields.number_value,custom_fields.enum_value.gid"
+    }
+    task = request("GET", path, params)
+    if project not in task_memberships(task["data"]):
+        raise RuntimeError("task_not_in_field_project")
+    settings = listing(
+        field_settings_path(project), {"opt_fields": FIELD_SETTINGS}, None
+    )
+    field = next(
+        (
+            item["custom_field"]
+            for item in settings["data"]
+            if item["custom_field"]["gid"] == field_gid
+        ),
+        None,
+    )
+    if field is None:
+        raise RuntimeError("custom_field_not_in_project")
+    subtype = field["resource_subtype"]
+    if (
+        field.get("is_formula_field")
+        or field.get("id_prefix") is not None
+        or subtype not in ("text", "number", "enum")
+    ):
+        raise RuntimeError("custom_field_type_not_writable")
+    if value is not None:
+        if subtype == "text":
+            valid = isinstance(value, str) and len(value) <= 1024
+        elif subtype == "number":
+            valid = type(value) is int or (
+                type(value) is float and math.isfinite(value)
+            )
+        else:
+            valid = any(
+                option["gid"] == value and option.get("enabled")
+                for option in field["enum_options"]
+            )
+        if not valid:
+            raise ValueError("invalid_custom_field_value")
+
+    def field_value(task_data):
+        for item in task_data["custom_fields"]:
+            if item["gid"] == field_gid:
+                current = item[subtype + "_value"]
+                return (current or {}).get("gid") if subtype == "enum" else current
+        raise RuntimeError("custom_field_not_on_task")
+
+    previous = field_value(task["data"])
+    change = audit_change(
+        {
+            "field_gid": field_gid,
+            "field_name": field["name"],
+            "field_project_gid": project,
+        },
+        subtype + "_value",
+        previous,
+        value,
+    )
+
+    def read():
+        result = request("GET", path, params)
+        return result, field_value(result["data"])
+
+    request("PUT", path, data={"custom_fields": {field_gid: value}})
+    return verify_change(gid, change, read, lambda actual: actual == value)
 
 
 def _main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "operation",
-        choices=[
-            "me",
-            "workspaces",
-            "users",
-            "resolve-user",
-            "projects",
-            "sections",
-            "tasks",
-            "subtasks",
-            "create-subtask",
-            "task",
-            "comments",
-            "search",
-            "create",
-            "update",
-            "comment",
-            "move",
-        ],
+        choices=ACTIONS,
     )
     parser.add_argument("--reason", help="操作理由を1行で指定（ログに記録）")
     parser.add_argument("--email", help="Asana登録メールアドレス")
@@ -444,8 +852,13 @@ def _main(argv=None):
     parser.add_argument("--workspace")
     parser.add_argument("--project")
     parser.add_argument("--section")
+    parser.add_argument("--depends-on")
+    parser.add_argument("--field")
+    parser.add_argument("--file", help="Local attachment file to upload")
+    parser.add_argument("--attachment", help="Attachment GID to delete")
     parser.add_argument("--text")
     parser.add_argument("--text-file")
+    parser.add_argument("--mention", action="append", default=[], metavar="USER_GID")
     parser.add_argument("--data", help="JSON object; null explicitly clears a field")
     parser.add_argument("--data-file")
     parser.add_argument("--max-items", type=int, default=100)
@@ -466,6 +879,16 @@ def _main(argv=None):
             parser.error(label + " is required")
         return value
 
+    def load_data():
+        if args.data is not None and args.data_file:
+            parser.error("choose --data or --data-file")
+        if args.data_file:
+            with open(args.data_file, encoding="utf-8") as stream:
+                data = json.load(stream)
+        else:
+            data = json.loads(need(args.data, "--data or --data-file"))
+        return data
+
     if args.max_items < 1:
         parser.error("--max-items must be positive")
     try:
@@ -477,6 +900,56 @@ def _main(argv=None):
     if args.offset:
         params["offset"] = args.offset
     op = args.operation
+    if args.mention and op != "comment":
+        parser.error("--mention is only supported by comment")
+    if op in ("dependencies", "attachments", "custom-fields"):
+        if op == "custom-fields":
+            project = require_gid(args.project, "--project", parser)
+            return listing(
+                field_settings_path(project),
+                pagination(params, FIELD_SETTINGS),
+                args.max_items,
+            )
+        gid = require_gid(args.gid, "--gid", parser)
+        if op == "dependencies":
+            return listing(
+                dependencies_path(gid),
+                pagination(params, DEPENDENCY_FIELDS),
+                args.max_items,
+            )
+        request("GET", f"/tasks/{gid}", {"opt_fields": TASK_IDENTITY})
+        return listing(
+            "/attachments",
+            dict(pagination(params, ATTACHMENT_FIELDS), parent=gid),
+            args.max_items,
+        )
+    if op in ("upload-attachment", "delete-attachment"):
+        gid = require_gid(args.gid, "--gid", parser)
+        if op == "upload-attachment":
+            return upload_attachment(gid, Path(need(args.file, "--file")))
+        return delete_attachment(
+            gid, require_gid(args.attachment, "--attachment", parser)
+        )
+    if op in ("add-dependency", "add-project", "set-custom-field"):
+        gid = require_gid(args.gid, "--gid", parser)
+        if op == "add-dependency":
+            prerequisite = require_gid(args.depends_on, "--depends-on", parser)
+            if gid == prerequisite:
+                parser.error("a task cannot depend on itself")
+            return add_dependency(gid, prerequisite)
+        project = require_gid(args.project, "--project", parser)
+        if op == "add-project":
+            section = (
+                require_gid(args.section, "--section", parser)
+                if args.section is not None
+                else None
+            )
+            return add_project(gid, project, section)
+        field = require_gid(args.field, "--field", parser)
+        data = load_data()
+        if not isinstance(data, dict) or set(data) != {"value"}:
+            parser.error("expected a JSON object containing only value")
+        return set_custom_field(gid, project, field, data["value"])
     if op == "me":
         return request("GET", "/users/me")
     if op == "resolve-user":
@@ -537,13 +1010,7 @@ def _main(argv=None):
     if op == "task":
         return request("GET", "/tasks/" + need(args.gid, "--gid"), params)
     if op in ("create", "update", "create-subtask"):
-        if args.data and args.data_file:
-            parser.error("choose --data or --data-file")
-        if args.data_file:
-            with open(args.data_file, encoding="utf-8") as stream:
-                data = json.load(stream)
-        else:
-            data = json.loads(need(args.data, "--data or --data-file"))
+        data = load_data()
         allowed = {
             "name",
             "notes",
@@ -586,6 +1053,13 @@ def _main(argv=None):
                 content = stream.read()
         else:
             content = need(args.text, "--text or --text-file")
+        if args.mention:
+            mentions = list(
+                dict.fromkeys(
+                    require_gid(value, "--mention", parser) for value in args.mention
+                )
+            )
+            return comment_with_mentions(gid, content, mentions)
         return request("POST", "/tasks/" + gid + "/stories", data={"text": content})
     section = need(args.section, "--section")
     target = request("GET", "/sections/" + section, {"opt_fields": "project.gid"})
@@ -643,31 +1117,21 @@ def main(argv=None):
 
 def run_main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
-    operations = {
-        "me",
-        "workspaces",
-        "users",
-        "resolve-user",
-        "projects",
-        "sections",
-        "tasks",
-        "subtasks",
-        "create-subtask",
-        "task",
-        "comments",
-        "search",
-        "create",
-        "update",
-        "comment",
-        "move",
-    }
     context = {
         "run_id": RUN_ID.get(),
-        "operation": args[0] if args and args[0] in operations else "invalid",
+        "operation": args[0] if args and args[0] in ACTIONS else "invalid",
         "cwd": str(Path.cwd()),
     }
     # Only numeric identifiers are logged; never serialize raw arguments or API bodies.
-    for flag in ("--gid", "--workspace", "--project", "--section"):
+    for flag in (
+        "--gid",
+        "--workspace",
+        "--project",
+        "--section",
+        "--depends-on",
+        "--field",
+        "--attachment",
+    ):
         for index, value in enumerate(args):
             candidate = (
                 args[index + 1]
